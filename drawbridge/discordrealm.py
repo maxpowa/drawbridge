@@ -6,6 +6,7 @@ from twisted.python import failure
 from twisted.words import service, iwords
 
 import discord
+import requests
 
 from zope.interface import implements
 from time import time
@@ -26,8 +27,8 @@ class DiscordWordsRealm(service.WordsRealm):
     def userFactory(self, name, credentials={}):
         return User(name, credentials)
 
-    def groupFactory(self, name):
-        return Group(name)
+    def groupFactory(self, name, server, channel):
+        return Group(name, server, channel)
 
     def logoutFactory(self, avatar, facet):
         def logout():
@@ -47,7 +48,7 @@ class DiscordWordsRealm(service.WordsRealm):
                 facet = iface(avatar, None)
                 if facet is not None:
                     avatar.loggedIn(self, mind)
-                    mind.name = avatarId
+                    mind.name = avatar.credentials.meta['username']
                     mind.realm = self
                     mind.avatar = avatar
                     return iface, facet, self.logoutFactory(avatar, facet)
@@ -94,11 +95,6 @@ class DiscordWordsRealm(service.WordsRealm):
 
     def getGroup(self, name):
         assert isinstance(name, unicode)
-        if self.createGroupOnRequest:
-            def ebGroup(err):
-                err.trap(ewords.DuplicateGroup)
-                return self.lookupGroup(name)
-            return self.createGroup(name).addErrback(ebGroup)
         return self.lookupGroup(name)
 
 
@@ -127,13 +123,14 @@ class DiscordWordsRealm(service.WordsRealm):
         return d
 
 
-    def createGroup(self, name):
+    def createGroup(self, server, channel):
+        name = server.name.replace(' ', '_') + "|" + channel.name.replace(' ', '_')
         assert isinstance(name, unicode)
         def cbLookup(group):
             return failure.Failure(ewords.DuplicateGroup(name))
         def ebLookup(err):
             err.trap(ewords.NoSuchGroup)
-            return self.groupFactory(name)
+            return self.groupFactory(name, server, channel)
 
         name = name.lower()
         d = self.lookupGroup(name)
@@ -144,12 +141,14 @@ class DiscordWordsRealm(service.WordsRealm):
 class Group(object):
     implements(iwords.IGroup)
 
-    def __init__(self, name):
+    def __init__(self, name, server, channel):
         self.name = name
+        self.server = server
+        self.channel = channel
         self.users = {}
         self.meta = {
-            "topic": "",
-            "topic_author": "",
+            "topic": channel.topic,
+            "topic_author": "discord",
             }
 
 
@@ -227,30 +226,64 @@ class Group(object):
         return iter(self.users.values())
 
 
+class DiscordClient(discord.Client):
+    def set_mind(self, mind):
+        self.mind = mind
+
+    def login(self, token):
+        self.token = token
+        self.email = None
+        self.headers['authorization'] = '{}'.format(self.token)
+        resp = requests.get(discord.endpoints.ME, headers=self.headers)
+        #log.debug(request_logging_format.format(response=resp.status_code))
+        if resp.status_code != 200:
+            if resp.status_code == 401:
+                raise LoginFailure('Improper token has been passed.')
+            else:
+                raise HTTPException(resp.status_code, None)
+        gateway = requests.get(discord.endpoints.GATEWAY, headers=self.headers)
+        self._create_websocket(gateway.json().get('url'), reconnect=False)
+        self._is_logged_in = True
+
+
 class User(object):
     implements(iwords.IUser)
 
     realm = None
     mind = None
-    discord = DiscordClient()
+    client = DiscordClient()
     discord_conn = None
 
     def __init__(self, name, credentials=None):
         self.name = name
         self.groups = []
-        self.message_queue = Queue()
         self.lastMessage = time()
-        if credentials:
-            self.discord.set_token(credentials)
-            discord_conn = Thread(target=self.discord.run, args=(False,))
-            discord_conn.start()
-
+        self.credentials = credentials
 
     def loggedIn(self, realm, mind):
+        self.init_events()
         self.realm = realm
         self.mind = mind
+        if self.credentials:
+            self.client.set_mind(self.mind)
+            self.client.login(self.credentials.token)
+            discord_conn = Thread(target=self.client.run)
+            discord_conn.daemon = True
+            discord_conn.start()
         self.signOn = time()
 
+    def init_events(self):
+        @self.client.event
+        def on_ready():
+            self.mind.svc_message('Connection to discord established.')
+            def join_fail(err):
+                print(err)
+            for chan in self.client.get_all_channels():
+                if chan.type != 'text':
+                    continue
+                d = self.realm.createGroup(chan.server, chan)
+                d.addCallback(self.mind.userJoined, self.mind)
+                d.addErrback(join_fail)
 
     def join(self, group):
         def cbJoin(result):
@@ -267,6 +300,7 @@ class User(object):
 
 
     def send(self, recipient, message):
+        # Translate to Discord
         self.lastMessage = time()
         return recipient.receive(self.mind, recipient, message)
 
@@ -276,13 +310,7 @@ class User(object):
 
 
     def logout(self):
+        if self.discord_conn:
+            self.client.logout()
         for g in self.groups[:]:
             self.leave(g)
-
-
-class DiscordClient(discord.Client):
-    def set_token(self, credentials):
-        self.token = credentials.token
-        self.headers = {
-            'authorization': self.token,
-        }

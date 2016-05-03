@@ -14,6 +14,8 @@ import discord
 from discordrealm import DiscordWordsRealm
 from discordauth import DiscordPortal, DiscordAuth
 
+import logging
+logging.basicConfig(level=logging.INFO)
 
 # ROOM = 'room'
 # USERS = dict(
@@ -39,32 +41,19 @@ class IRCProtocol(service.IRCUser):
         (irc.RPL_ENDOFMOTD, ":End of /MOTD command.")
         ]
 
-    def process_queue(self):
-        if not self.avatar:
-            return
-
-        while not self.avatar.message_queue.empty():
-            msg = self.avatar.message_queue.get()
-            self.sendMessage(*msg)
-
     def connectionMade(self):
         # Nooope, we'll just stop this right here.
         self.irc_PRIVMSG = self.irc_DISCORD_PRIVMSG
-        self.task_id = None
         self.realm = self.factory.realm
         self.hostname = self.realm.name
 
     def connectionLost(self, reason):
-        try:
-            if self.task_id is not None:
-                self.task_id.stop()
-        except AssertionError:
-            # Sometimes it will fail because the task has stopped early
-            pass
-
         if self.logout is not None:
             self.logout()
             self.avatar = None
+
+    def svc_message(self, message):
+        self.notice(DISCORD, self.nickname, message)
 
     def irc_DISCORD_PRIVMSG(self, prefix, params):
         """Send a (private) message.
@@ -131,11 +120,6 @@ class IRCProtocol(service.IRCUser):
         self.logout = logout
         for code, text in self._welcomeMessages:
             self.sendMessage(code, text % self.factory._serverInfo)
-
-        # start our message queue as well
-        self.task_id = task.LoopingCall(self.process_queue)
-        # Run every half a second. This just shows messages from discord to IRC connections
-        self.task_id.start(1.0)
 
     def _ebLogin(self, err, nickname):
         if err.check(ewords.AlreadyLoggedIn):
