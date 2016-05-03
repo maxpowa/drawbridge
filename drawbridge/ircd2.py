@@ -2,7 +2,7 @@ import sys
 
 from time import ctime
 
-from twisted.cred import checkers, portal, error as ecred
+from twisted.cred import error as ecred
 from twisted.internet import reactor, protocol, task
 from twisted.internet.endpoints import TCP4ServerEndpoint
 from twisted.python import log
@@ -11,9 +11,8 @@ from twisted.words.protocols import irc
 
 import discord
 
-from Queue import Queue
-
-from discordrealm import DiscordWordsRealm, DiscordChecker, DiscordUser
+from discordrealm import DiscordWordsRealm
+from discordauth import DiscordPortal, DiscordAuth
 
 
 # ROOM = 'room'
@@ -51,12 +50,13 @@ class IRCProtocol(service.IRCUser):
     def connectionMade(self):
         # Nooope, we'll just stop this right here.
         self.irc_PRIVMSG = self.irc_DISCORD_PRIVMSG
+        self.task_id = None
         self.realm = self.factory.realm
         self.hostname = self.realm.name
 
     def connectionLost(self, reason):
         try:
-            if self.task_id:
+            if self.task_id is not None:
                 self.task_id.stop()
         except AssertionError:
             # Sometimes it will fail because the task has stopped early
@@ -114,13 +114,15 @@ class IRCProtocol(service.IRCUser):
 
     def logInAs(self, nickname, password):
         d = self.factory.portal.login(
-            DiscordUser(nickname, password, discord.Client()),
+            DiscordAuth(nickname, password, discord.Client()),
             self,
             iwords.IUser)
         d.addCallbacks(self._cbLogin, self._ebLogin, errbackArgs=(nickname,))
 
     def _cbLogin(self, (iface, avatar, logout)):
         assert iface is iwords.IUser, "Realm is buggy, got %r" % (iface,)
+
+        print(repr(logout))
 
         # Let them send messages to the world
         del self.irc_PRIVMSG
@@ -179,9 +181,7 @@ if __name__ == '__main__':
 
     # Initialize the Cred authentication system used by the IRC server.
     realm = DiscordWordsRealm('discord.gg')
-    #realm.addGroup(service.Group(ROOM))
-    user_db = DiscordChecker()
-    portal = portal.Portal(realm, [user_db])
+    portal = DiscordPortal(realm)
 
     # IRC server factory.
     ircfactory = IRCBridge(realm, portal)

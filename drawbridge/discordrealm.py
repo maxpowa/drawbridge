@@ -3,56 +3,40 @@ from twisted.words import ewords
 
 from twisted.internet import defer
 from twisted.python import failure
-from twisted.cred import error, credentials, checkers
-from twisted.words import service
+from twisted.words import service, iwords
 
-from zope.interface import implementer
+import discord
 
+from zope.interface import implements
 from time import time
-
-class TokenBucket(object):
-    """An implementation of the token bucket algorithm.
-
-    >>> bucket = TokenBucket(80, 0.5)
-    >>> print bucket.consume(10)
-    True
-    >>> print bucket.consume(90)
-    False
-    """
-    def __init__(self, tokens, fill_rate):
-        """tokens is the total tokens in the bucket. fill_rate is the
-        rate in tokens/second that the bucket will be refilled."""
-        self.capacity = float(tokens)
-        self._tokens = float(tokens)
-        self.fill_rate = float(fill_rate)
-        self.timestamp = time()
-
-    def consume(self, tokens):
-        """Consume tokens from the bucket. Returns True if there were
-        sufficient tokens otherwise False."""
-        if tokens <= self.tokens:
-            self._tokens -= tokens
-        else:
-            return False
-        return True
-
-    def get_tokens(self):
-        if self._tokens < self.capacity:
-            now = time()
-            delta = self.fill_rate * (now - self.timestamp)
-            self._tokens = min(self.capacity, self._tokens + delta)
-            self.timestamp = now
-        return self._tokens
-    tokens = property(get_tokens)
-
+from Queue import Queue
+from threading import Thread
 
 class DiscordWordsRealm(service.WordsRealm):
+    _encoding = 'utf-8'
+
     def __init__(self, *a, **kw):
         super(DiscordWordsRealm, self).__init__(*a, **kw)
         self.users = {}
         self.guilds = {}
 
-    def requestAvatar(self, avatarId, mind, *interfaces):
+    def itergroups(self):
+        return defer.succeed(self.guilds.itervalues())
+
+    def userFactory(self, name, credentials={}):
+        return User(name, credentials)
+
+    def groupFactory(self, name):
+        return Group(name)
+
+    def logoutFactory(self, avatar, facet):
+        def logout():
+            # XXX Deferred support here
+            getattr(facet, 'logout', lambda: None)()
+            avatar.realm = avatar.mind = None
+        return logout
+
+    def requestAvatar(self, avatarId, credentials, mind, *interfaces):
         if isinstance(avatarId, str):
             avatarId = avatarId.decode(self._encoding)
 
@@ -69,11 +53,7 @@ class DiscordWordsRealm(service.WordsRealm):
                     return iface, facet, self.logoutFactory(avatar, facet)
             raise NotImplementedError(self, interfaces)
 
-        return self.getUser(avatarId).addCallback(gotAvatar)
-
-
-    def itergroups(self):
-        return defer.succeed(self.guilds.itervalues())
+        return self.getUser(avatarId, credentials).addCallback(gotAvatar)
 
     def addUser(self, user):
         print('addUser ' + repr(user))
@@ -122,23 +102,23 @@ class DiscordWordsRealm(service.WordsRealm):
         return self.lookupGroup(name)
 
 
-    def getUser(self, name):
+    def getUser(self, name, credentials={}):
         assert isinstance(name, unicode)
         if self.createUserOnRequest:
             def ebUser(err):
                 err.trap(ewords.DuplicateUser)
                 return self.lookupUser(name)
-            return self.createUser(name).addErrback(ebUser)
+            return self.createUser(name, credentials).addErrback(ebUser)
         return self.lookupUser(name)
 
 
-    def createUser(self, name):
+    def createUser(self, name, credentials={}):
         assert isinstance(name, unicode)
         def cbLookup(user):
             return failure.Failure(ewords.DuplicateUser(name))
         def ebLookup(err):
             err.trap(ewords.NoSuchUser)
-            return self.userFactory(name)
+            return self.userFactory(name, credentials)
 
         name = name.lower()
         d = self.lookupUser(name)
@@ -161,68 +141,148 @@ class DiscordWordsRealm(service.WordsRealm):
         d.addCallback(self.addGroup)
         return d
 
+class Group(object):
+    implements(iwords.IGroup)
 
-class IDiscordUser(credentials.ICredentials):
-    def checkPassword(password):
-        """
-        quite obviously required
-        """
-
-
-@implementer(IDiscordUser)
-class DiscordUser:
-    def __init__(self, username, password, discord):
-        self.username = username
-        self.password = password
-        self.discord = discord
-
-    def checkPassword(self, password):
-        key = [password]
-        if '/' in password:
-            key = password.split('/', 1)
-        try:
-            self.discord.login(*key)
-        except LoginFailure:
-            return False
-        except HTTPException:
-            return False
-        except ValueError:
-            return False
-        return True
-
-@implementer(checkers.ICredentialsChecker)
-class DiscordChecker(object):
-    credentialInterfaces = (IDiscordUser,)
-
-    def __init__(self):
-        self.rate_limit = {}
+    def __init__(self, name):
+        self.name = name
         self.users = {}
+        self.meta = {
+            "topic": "",
+            "topic_author": "",
+            }
 
 
-    def addUser(self, username, password):
-        raise ValueError('generate stack')
-        self.users[username] = password
+    def _ebUserCall(self, err, p):
+        return failure.Failure(Exception(p, err))
 
 
-    def _cbPasswordMatch(self, matched, username):
-        if matched:
-            return username
+    def _cbUserCall(self, results):
+        for (success, result) in results:
+            if not success:
+                user, err = result.value # XXX
+                self.remove(user, err.getErrorMessage())
+
+
+    def add(self, user):
+        assert iwords.IChatClient.providedBy(user), "%r is not a chat client" % (user,)
+        if user.name not in self.users:
+            additions = []
+            self.users[user.name] = user
+            for p in self.users.itervalues():
+                if p is not user:
+                    d = defer.maybeDeferred(p.userJoined, self, user)
+                    d.addErrback(self._ebUserCall, p=p)
+                    additions.append(d)
+            defer.DeferredList(additions).addCallback(self._cbUserCall)
+        return defer.succeed(None)
+
+
+    def remove(self, user, reason=None):
+        assert reason is None or isinstance(reason, unicode)
+        try:
+            del self.users[user.name]
+        except KeyError:
+            pass
         else:
-            return failure.Failure(error.UnauthorizedLogin())
+            removals = []
+            for p in self.users.itervalues():
+                if p is not user:
+                    d = defer.maybeDeferred(p.userLeft, self, user, reason)
+                    d.addErrback(self._ebUserCall, p=p)
+                    removals.append(d)
+            defer.DeferredList(removals).addCallback(self._cbUserCall)
+        return defer.succeed(None)
 
 
-    def rate_limit_middleware(self, credentials):
-        if not credentials.username in self.rate_limit:
-            # Rate limit to 5 attempts every 5 minutes. We don't wanna get banned from discord.
-            self.rate_limit[credentials.username] = TokenBucket(5, float(5/300))
-        return self.rate_limit[credentials.username].consume(1)
+    def size(self):
+        return defer.succeed(len(self.users))
 
 
-    def requestAvatarId(self, credentials):
-        if credentials.username in self.users and self.rate_limit_middleware(credentials):
-            return defer.maybeDeferred(
-                credentials.checkPassword,
-                self.users[credentials.username]).addCallback(
-                self._cbPasswordMatch, credentials.username)
-        else:
-            return defer.fail(error.LoginDenied())
+    def receive(self, sender, recipient, message):
+        assert recipient is self
+        receives = []
+        for p in self.users.itervalues():
+            if p is not sender:
+                d = defer.maybeDeferred(p.receive, sender, self, message)
+                d.addErrback(self._ebUserCall, p=p)
+                receives.append(d)
+        defer.DeferredList(receives).addCallback(self._cbUserCall)
+        return defer.succeed(None)
+
+
+    def setMetadata(self, meta):
+        self.meta = meta
+        sets = []
+        for p in self.users.itervalues():
+            d = defer.maybeDeferred(p.groupMetaUpdate, self, meta)
+            d.addErrback(self._ebUserCall, p=p)
+            sets.append(d)
+        defer.DeferredList(sets).addCallback(self._cbUserCall)
+        return defer.succeed(None)
+
+
+    def iterusers(self):
+        # XXX Deferred?
+        return iter(self.users.values())
+
+
+class User(object):
+    implements(iwords.IUser)
+
+    realm = None
+    mind = None
+    discord = DiscordClient()
+    discord_conn = None
+
+    def __init__(self, name, credentials=None):
+        self.name = name
+        self.groups = []
+        self.message_queue = Queue()
+        self.lastMessage = time()
+        if credentials:
+            self.discord.set_token(credentials)
+            discord_conn = Thread(target=self.discord.run, args=(False,))
+            discord_conn.start()
+
+
+    def loggedIn(self, realm, mind):
+        self.realm = realm
+        self.mind = mind
+        self.signOn = time()
+
+
+    def join(self, group):
+        def cbJoin(result):
+            self.groups.append(group)
+            return result
+        return group.add(self.mind).addCallback(cbJoin)
+
+
+    def leave(self, group, reason=None):
+        def cbLeave(result):
+            self.groups.remove(group)
+            return result
+        return group.remove(self.mind, reason).addCallback(cbLeave)
+
+
+    def send(self, recipient, message):
+        self.lastMessage = time()
+        return recipient.receive(self.mind, recipient, message)
+
+
+    def itergroups(self):
+        return iter(self.groups)
+
+
+    def logout(self):
+        for g in self.groups[:]:
+            self.leave(g)
+
+
+class DiscordClient(discord.Client):
+    def set_token(self, credentials):
+        self.token = credentials.token
+        self.headers = {
+            'authorization': self.token,
+        }
