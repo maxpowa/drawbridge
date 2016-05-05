@@ -5,8 +5,7 @@ from twisted.internet import defer
 from twisted.python import failure
 from twisted.words import service, iwords
 
-import discord
-import requests
+import chord
 
 from zope.interface import implements
 from time import time
@@ -226,64 +225,54 @@ class Group(object):
         return iter(self.users.values())
 
 
-class DiscordClient(discord.Client):
-    def set_mind(self, mind):
-        self.mind = mind
+class DiscordClient(chord.Client):
+    mind = None
 
-    def login(self, token):
-        self.token = token
-        self.email = None
-        self.headers['authorization'] = '{}'.format(self.token)
-        resp = requests.get(discord.endpoints.ME, headers=self.headers)
-        #log.debug(request_logging_format.format(response=resp.status_code))
-        if resp.status_code != 200:
-            if resp.status_code == 401:
-                raise LoginFailure('Improper token has been passed.')
-            else:
-                raise HTTPException(resp.status_code, None)
-        gateway = requests.get(discord.endpoints.GATEWAY, headers=self.headers)
-        self._create_websocket(gateway.json().get('url'), reconnect=False)
-        self._is_logged_in = True
+    def handle_error(self, failure):
+        self.mind.svc_message('Uncaught error ' + str(failure.value))
+        failure.raiseException()
+
+    def login(self, token, reactor=None):
+        self.deferred = self.fetch_gateway(token)
+
+        self.deferred.addErrback(self.handle_error)
+
+        self.deferred.addCallback(self.connect)
+
+        return self.deferred
 
 
-class User(object):
+class User(DiscordClient):
     implements(iwords.IUser)
 
     realm = None
-    mind = None
-    client = DiscordClient()
-    discord_conn = None
 
-    def __init__(self, name, credentials=None):
+    def __init__(self, name, credentials=None, reactor=None):
+        if reactor is None:
+            from twisted.internet import reactor
+        self.reactor = reactor
         self.name = name
         self.groups = []
         self.lastMessage = time()
         self.credentials = credentials
 
     def loggedIn(self, realm, mind):
-        self.init_events()
         self.realm = realm
         self.mind = mind
-        if self.credentials:
-            self.client.set_mind(self.mind)
-            self.client.login(self.credentials.token)
-            discord_conn = Thread(target=self.client.run)
-            discord_conn.daemon = True
-            discord_conn.start()
         self.signOn = time()
+        if self.credentials:
+            defer.maybeDeferred(self.login, self.credentials.token)
 
-    def init_events(self):
-        @self.client.event
-        def on_ready():
-            self.mind.svc_message('Connection to discord established.')
-            def join_fail(err):
-                print(err)
-            for chan in self.client.get_all_channels():
-                if chan.type != 'text':
-                    continue
-                d = self.realm.createGroup(chan.server, chan)
-                d.addCallback(self.mind.userJoined, self.mind)
-                d.addErrback(join_fail)
+    def on_ready(self, data):
+        self.mind.svc_message('Connection to discord established.')
+        def join_fail(err):
+            print(err)
+        for chan in self.get_all_channels():
+            if chan.type != 'text':
+                continue
+            d = self.realm.createGroup(chan.server, chan)
+            d.addCallback(self.mind.userJoined, self.mind)
+            d.addErrback(join_fail)
 
     def join(self, group):
         def cbJoin(result):
@@ -310,7 +299,5 @@ class User(object):
 
 
     def logout(self):
-        if self.discord_conn:
-            self.client.logout()
         for g in self.groups[:]:
             self.leave(g)

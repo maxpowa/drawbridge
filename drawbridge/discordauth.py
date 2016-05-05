@@ -2,8 +2,7 @@ from twisted.internet import defer
 from twisted.python import failure
 from twisted.cred import error, credentials, checkers
 
-import discord
-import requests
+import chord
 
 from zope.interface import implementer
 from time import time
@@ -56,53 +55,39 @@ class IDiscordAuth(credentials.ICredentials):
 
 @implementer(IDiscordAuth)
 class DiscordAuth:
-    def __init__(self, username, password, discord):
+    def __init__(self, username, password):
         self.username = username
         self.password = password
         self.token = None
         self.meta = {}
 
+    def set_token(self, token):
+        self.token = token
+        return defer.succeed(token)
+
+    def set_meta(self, meta):
+        self.meta = meta
+        return defer.succeed(meta)
+
     def checkPassword(self, password):
         key = [password]
         if '/' in password:
             key = password.split('/', 1)
-        try:
-            self.token = self.test_creds(*key)
-        except ValueError:
-            return False
-        return True
+        d = self.test_creds(*key)
+        d.addCallback(self.set_token)
+        d.addCallback(chord.get_user_for_token)
+        d.addCallback(self.set_meta)
+        return d
 
     def test_creds(self, *args):
         if len(args) in [1,2]:
             if len(args)==1:
                 (token,) = args
-                headers = {
-                    'authorization': '{}'.format(token)
-                }
-                r = requests.get(discord.endpoints.ME, headers=headers)
-                if r.status_code != 200:
-                    raise ValueError('Improper credentials')
-                self.meta = r.json()
-                return token
+                return chord.check_token(token)
 
             if len(args)==2:
                 (email, password) = args
-                payload = {
-                    'email': email,
-                    'password': password
-                }
-                r = requests.post(discord.endpoints.LOGIN, json=payload)
-                if r.status_code != 200:
-                    raise ValueError('Improper credentials')
-                token = r.json()['token']
-                headers = {
-                    'authorization': '{}'.format(token)
-                }
-                r = requests.get(discord.endpoints.ME, headers=headers)
-                if r.status_code != 200:
-                    raise ValueError('Improper credentials')
-                self.meta = r.json()
-                return token
+                return chord.get_token(email, password)
 
 
 @implementer(checkers.ICredentialsChecker)

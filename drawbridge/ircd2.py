@@ -9,10 +9,10 @@ from twisted.python import log
 from twisted.words import service, iwords, ewords
 from twisted.words.protocols import irc
 
-import discord
-
 from discordrealm import DiscordWordsRealm
 from discordauth import DiscordPortal, DiscordAuth
+
+import chord
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -103,7 +103,7 @@ class IRCProtocol(service.IRCUser):
 
     def logInAs(self, nickname, password):
         d = self.factory.portal.login(
-            DiscordAuth(nickname, password, discord.Client()),
+            DiscordAuth(nickname, password),
             self,
             iwords.IUser)
         d.addCallbacks(self._cbLogin, self._ebLogin, errbackArgs=(nickname,))
