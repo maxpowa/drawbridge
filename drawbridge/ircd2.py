@@ -6,6 +6,7 @@ from twisted.cred import error as ecred
 from twisted.internet import reactor, protocol, task
 from twisted.internet.endpoints import TCP4ServerEndpoint
 from twisted.python import log
+from twisted.python import logfile
 from twisted.words import service, iwords, ewords
 from twisted.words.protocols import irc
 
@@ -14,19 +15,11 @@ from discordauth import DiscordPortal, DiscordAuth
 
 import chord
 
-import logging
-logging.basicConfig(level=logging.INFO)
-
-# ROOM = 'room'
-# USERS = dict(
-#     maxpowa='abc123',
-#     user2='pass2',
-#     user3='pass3',
-#     user4='pass4')
-
 DISCORD = "Discord!services@discord.gg"
 
 class IRCProtocol(service.IRCUser):
+
+    avatar = None
 
     _welcomeMessages = [ (irc.RPL_WELCOME, ":Welcome to %(serviceName)s %(serviceVersion)s, the ugliest Discord bridge in the world.") ]
 
@@ -68,9 +61,40 @@ class IRCProtocol(service.IRCUser):
             self.notice(DISCORD, self.nickname,
                 "Please wait until authentication has completed to send messages.")
 
+
+    def irc_WHOIS(self, prefix, params):
+        """Whois query
+        Parameters: [ <target> ] <mask> *( "," <mask> )
+        """
+        def cbUser(user):
+            self.whois(
+                self.name,
+                user.name, user.id, self.realm.name,
+                user.realName, self.realm.name, user.gateway, False,
+                0, 0,
+                ['#' + group.name for group in user.itergroups()])
+
+        def ebUser(err):
+            err.trap(ewords.NoSuchUser)
+            self.sendMessage(
+                irc.ERR_NOSUCHNICK,
+                params[0],
+                ":No such nick/channel")
+
+        try:
+            user = params[0].decode(self.encoding)
+        except UnicodeDecodeError:
+            self.sendMessage(
+                irc.ERR_NOSUCHNICK,
+                params[0],
+                ":No such nick/channel")
+            return
+
+        self.realm.lookupUser(user).addCallbacks(cbUser, ebUser)
+
     def irc_NICK(self, prefix, params):
         """Nick message -- Set your nickname.
-        Parameters: <nickname>
+        Parameters: <nickname> [password]
         [REQUIRED]
         TODO: Update to verify nick updates with Discord
         """
@@ -83,7 +107,7 @@ class IRCProtocol(service.IRCUser):
             self.transport.loseConnection()
             return
 
-        if self.password is None:
+        if self.password is None and not self.avatar:
             self.notice(DISCORD, nickname,
                 'You must enter your Discord email and password in the Server '
                 'Password box of your client. Ensure they are slash separated,'
@@ -91,15 +115,34 @@ class IRCProtocol(service.IRCUser):
             self.transport.loseConnection()
             return
 
-        self.nickname = nickname
-        self.name = nickname
+        def wrongPass(failure):
+            failure.trap(chord.errors.LoginError)
+            self.svc_message('Unable to change nick, are you sure you used the correct password?')
 
-        for code, text in self._motdMessages:
-            self.sendMessage(code, text.format(**self.factory._serverInfo))
+        def rateLimited(failure):
+            failure.trap(chord.errors.RateLimitError)
+            self.svc_message('Username changes are rate limited to 2 per hour!')
 
-        password = self.password
-        self.password = None
-        self.logInAs(nickname, password)
+        def onSuccess(*args, **kwargs):
+            self.nickname = nickname
+            self.name = nickname
+
+        if not self.avatar:
+            onSuccess()
+            for code, text in self._motdMessages:
+                self.sendMessage(code, text.format(**self.factory._serverInfo))
+            password = self.password
+            self.password = None
+            self.logInAs(nickname, password)
+        else:
+            if len(params) != 2:
+                return self.svc_message('NICK must include password. NICK <username> <password>')
+            password = params[1]
+            d = self.avatar.change_nick(nickname, password)
+            d.addCallback(onSuccess)
+            d.addErrback(wrongPass)
+            d.addErrback(rateLimited)
+
 
     def logInAs(self, nickname, password):
         d = self.factory.portal.login(
@@ -110,8 +153,6 @@ class IRCProtocol(service.IRCUser):
 
     def _cbLogin(self, (iface, avatar, logout)):
         assert iface is iwords.IUser, "Realm is buggy, got %r" % (iface,)
-
-        print(repr(logout))
 
         # Let them send messages to the world
         del self.irc_PRIVMSG
@@ -131,6 +172,9 @@ class IRCProtocol(service.IRCUser):
         elif err.check(ecred.LoginDenied):
             self.notice(DISCORD, nickname,
                 "Login denied. You've probably hit the rate limit.")
+        elif err.check(chord.errors.LoginError):
+            self.notice(DISCORD, nickname,
+                "Unable to login, are you sure you used the correct email and password?")
         else:
             log.msg("Unhandled error during login:")
             log.err(err)
@@ -161,7 +205,9 @@ class IRCBridge(protocol.ServerFactory):
 
 
 if __name__ == '__main__':
-    log.startLogging(sys.stdout)
+    chord.start_logging()
+    #log.startLogging(sys.stdout)
+    #log.startLogging(logfile.LogFile('out.log', '.', rotateLength=None))
 
     # Initialize the Cred authentication system used by the IRC server.
     realm = DiscordWordsRealm('discord.gg')

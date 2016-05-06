@@ -5,10 +5,10 @@ from twisted.internet import defer
 from twisted.python import failure
 from twisted.words import service, iwords
 
+import json
 import chord
 
 from zope.interface import implements
-from time import time
 from Queue import Queue
 from threading import Thread
 
@@ -23,8 +23,8 @@ class DiscordWordsRealm(service.WordsRealm):
     def itergroups(self):
         return defer.succeed(self.guilds.itervalues())
 
-    def userFactory(self, name, credentials={}):
-        return User(name, credentials)
+    def userFactory(self, name, credentials=None):
+        return User(name, credentials=credentials)
 
     def groupFactory(self, name, server, channel):
         return Group(name, server, channel)
@@ -53,10 +53,9 @@ class DiscordWordsRealm(service.WordsRealm):
                     return iface, facet, self.logoutFactory(avatar, facet)
             raise NotImplementedError(self, interfaces)
 
-        return self.getUser(avatarId, credentials).addCallback(gotAvatar)
+        return self.getUser(credentials.meta['username'], credentials).addCallback(gotAvatar)
 
     def addUser(self, user):
-        print('addUser ' + repr(user))
         if user.name in self.users:
             return defer.fail(failure.Failure(ewords.DuplicateUser()))
         self.users[user.name] = user
@@ -71,7 +70,6 @@ class DiscordWordsRealm(service.WordsRealm):
 
 
     def lookupUser(self, name):
-        print('lookupUser ' + repr(name))
         assert isinstance(name, unicode)
         name = name.lower()
         try:
@@ -97,25 +95,27 @@ class DiscordWordsRealm(service.WordsRealm):
         return self.lookupGroup(name)
 
 
-    def getUser(self, name, credentials={}):
-        assert isinstance(name, unicode)
+    def getUser(self, id, credentials=None):
+        assert isinstance(id, unicode)
+        assert credentials is not None
         if self.createUserOnRequest:
             def ebUser(err):
                 err.trap(ewords.DuplicateUser)
-                return self.lookupUser(name)
-            return self.createUser(name, credentials).addErrback(ebUser)
-        return self.lookupUser(name)
+                return self.lookupUser(id)
+            return self.createUser(id, credentials).addErrback(ebUser)
+        return self.lookupUser(id)
 
 
-    def createUser(self, name, credentials={}):
-        assert isinstance(name, unicode)
+    def createUser(self, id, credentials=None):
+        assert isinstance(id, unicode)
+        assert credentials is not None
         def cbLookup(user):
-            return failure.Failure(ewords.DuplicateUser(name))
+            return failure.Failure(ewords.DuplicateUser(id))
         def ebLookup(err):
             err.trap(ewords.NoSuchUser)
-            return self.userFactory(name, credentials)
+            return self.userFactory(id, credentials)
 
-        name = name.lower()
+        name = credentials.meta['username'].lower()
         d = self.lookupUser(name)
         d.addCallbacks(cbLookup, ebLookup)
         d.addCallback(self.addUser)
@@ -236,7 +236,6 @@ class DiscordClient(chord.Client):
         self.deferred = self.fetch_gateway(token)
 
         self.deferred.addErrback(self.handle_error)
-
         self.deferred.addCallback(self.connect)
 
         return self.deferred
@@ -245,34 +244,29 @@ class DiscordClient(chord.Client):
 class User(DiscordClient):
     implements(iwords.IUser)
 
+    meta = None
     realm = None
+
+    gateway = ''
+    realName = ''
+    lazy_guilds = 0
 
     def __init__(self, name, credentials=None, reactor=None):
         if reactor is None:
             from twisted.internet import reactor
         self.reactor = reactor
         self.name = name
+        self.id = name
         self.groups = []
-        self.lastMessage = time()
         self.credentials = credentials
+        if self.credentials:
+            self.set_meta(credentials.meta)
 
     def loggedIn(self, realm, mind):
         self.realm = realm
         self.mind = mind
-        self.signOn = time()
         if self.credentials:
             defer.maybeDeferred(self.login, self.credentials.token)
-
-    def on_ready(self, data):
-        self.mind.svc_message('Connection to discord established.')
-        def join_fail(err):
-            print(err)
-        for chan in self.get_all_channels():
-            if chan.type != 'text':
-                continue
-            d = self.realm.createGroup(chan.server, chan)
-            d.addCallback(self.mind.userJoined, self.mind)
-            d.addErrback(join_fail)
 
     def join(self, group):
         def cbJoin(result):
@@ -290,7 +284,6 @@ class User(DiscordClient):
 
     def send(self, recipient, message):
         # Translate to Discord
-        self.lastMessage = time()
         return recipient.receive(self.mind, recipient, message)
 
 
@@ -299,5 +292,69 @@ class User(DiscordClient):
 
 
     def logout(self):
+        self.disconnect(u'Leaving...')
         for g in self.groups[:]:
             self.leave(g)
+
+    def set_meta(self, meta):
+        self.meta = meta
+        self.realName = '{username}#{discriminator}'.format(**meta)
+        self.name = meta['username']
+        self.id = meta['id']
+
+    # Start discord parsing
+
+    def on_ready(self, data):
+        self.mind.svc_message('Connection to discord established.')
+
+        self.gateway = data.get('_trace', ('unknown gateway',))[0]
+
+        self.set_meta(data.get('user'))
+
+        for guild in data.get('guilds', []):
+            unavailable = guild.get('unavailable', None)
+
+            if unavailable is None or unavailable is False: # it's available!
+                #self.mind.join()
+                pass
+            else:
+                self.lazy_guilds = self.lazy_guilds + 1
+
+        # def join_fail(err):
+        #     print(err)
+        # for chan in self.get_all_channels():
+        #     if chan.type != 'text':
+        #         continue
+        #     d = self.realm.createGroup(chan.server, chan)
+        #     d.addCallback(self.mind.userJoined, self.mind)
+        #     d.addErrback(join_fail)
+
+    def change_nick(self, nick, password):
+        payload = {
+            'username': nick,
+            'password': password,
+            'email': self.meta['email'],
+            'avatar': self.meta['avatar']
+        }
+
+        def handle_success(body):
+            self.set_meta(json.loads(body))
+
+        d = chord.http_patch('https://discordapp.com/api/users/@me', self.credentials.token, payload)
+        d.addCallback(handle_success)
+        return d
+
+    def update_user(self, presence):
+        pass
+
+    def on_typing_start(self, data):
+        # Literally unused
+        pass
+
+    def on_presence_update(self, data):
+        id = data['user']['id']
+        #self.realm.update_user()
+        #self.mind.svc_message(repr(data))
+
+    def on_user_update(self, data):
+        self.mind.svc_message(repr(data))

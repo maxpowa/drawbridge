@@ -80,14 +80,16 @@ class DiscordAuth:
         return d
 
     def test_creds(self, *args):
-        if len(args) in [1,2]:
-            if len(args)==1:
-                (token,) = args
-                return chord.check_token(token)
+        if len(args) not in [1,2]:
+            return failure.Failure(error.UnauthorizedLogin('Unknown login format'))
 
-            if len(args)==2:
-                (email, password) = args
-                return chord.get_token(email, password)
+        print(repr(args))
+        if len(args)==1:
+            (token,) = args
+            return chord.check_token(token)
+        if len(args)==2:
+            (email, password) = args
+            return chord.get_token(email, password)
 
 
 @implementer(checkers.ICredentialsChecker)
