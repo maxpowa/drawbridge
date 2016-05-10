@@ -3,15 +3,15 @@ import sys
 from time import ctime
 
 from twisted.cred import error as ecred
-from twisted.internet import reactor, protocol, task
+from twisted.internet import reactor, protocol, task, defer
 from twisted.internet.endpoints import TCP4ServerEndpoint
 from twisted.python import log
 from twisted.python import logfile
 from twisted.words import service, iwords, ewords
 from twisted.words.protocols import irc
 
-from discordrealm import DiscordWordsRealm
-from discordauth import DiscordPortal, DiscordAuth
+from realm import DiscordWordsRealm, User
+from auth import DiscordAuthenticator
 
 import chord
 
@@ -19,6 +19,7 @@ DISCORD = "Discord!services@discord.gg"
 
 class IRCProtocol(service.IRCUser):
 
+    _authenticator = None
     avatar = None
 
     _welcomeMessages = [ (irc.RPL_WELCOME, ":Welcome to %(serviceName)s %(serviceVersion)s, the ugliest Discord bridge in the world.") ]
@@ -42,8 +43,8 @@ class IRCProtocol(service.IRCUser):
 
     def connectionLost(self, reason):
         if self.logout is not None:
-            self.logout()
-            self.avatar = None
+            self.avatar.disconnect(reason)
+            defer.maybeDeferred(self.logout)
 
     def svc_message(self, message):
         self.notice(DISCORD, self.nickname, message)
@@ -58,8 +59,7 @@ class IRCProtocol(service.IRCUser):
         if self.nickname is None:
             self.transport.loseConnection()
         else:
-            self.notice(DISCORD, self.nickname,
-                "Please wait until authentication has completed to send messages.")
+            self.svc_message("Please wait until authentication has completed to send messages.")
 
 
     def irc_WHOIS(self, prefix, params):
@@ -102,14 +102,12 @@ class IRCProtocol(service.IRCUser):
         try:
             nickname = nickname.decode(self.encoding)
         except UnicodeDecodeError:
-            self.notice(DISCORD, nickname,
-                'Your nickname cannot be decoded. Please use ASCII or UTF-8.')
+            self.svc_message('Your nickname cannot be decoded. Please use ASCII or UTF-8.')
             self.transport.loseConnection()
             return
 
         if self.password is None and not self.avatar:
-            self.notice(DISCORD, nickname,
-                'You must enter your Discord email and password in the Server '
+            self.svc_message('You must enter your Discord email and password in the Server '
                 'Password box of your client. Ensure they are slash separated,'
                 ' like the following: "user@email.com/securePassword".')
             self.transport.loseConnection()
@@ -143,55 +141,61 @@ class IRCProtocol(service.IRCUser):
             d.addErrback(wrongPass)
             d.addErrback(rateLimited)
 
-
     def logInAs(self, nickname, password):
-        d = self.factory.portal.login(
-            DiscordAuth(nickname, password),
-            self,
-            iwords.IUser)
+        d = self._authenticator.checkPassword(password)
         d.addCallbacks(self._cbLogin, self._ebLogin, errbackArgs=(nickname,))
 
-    def _cbLogin(self, (iface, avatar, logout)):
-        assert iface is iwords.IUser, "Realm is buggy, got %r" % (iface,)
-
+    def _cbLogin(self, meta):
         # Let them send messages to the world
         del self.irc_PRIVMSG
 
-        self.avatar = avatar
-        self.logout = logout
+        self.avatar = User(self.nickname, self._authenticator)
+        self.avatar.loggedIn(self.realm, self)
+
+        self.logout = self._authenticator.logout
         for code, text in self._welcomeMessages:
             self.sendMessage(code, text % self.factory._serverInfo)
 
     def _ebLogin(self, err, nickname):
         if err.check(ewords.AlreadyLoggedIn):
-            self.notice(DISCORD, nickname,
-                "Already logged in.  No pod people allowed!")
+            self.svc_message("Already logged in.  No pod people allowed!")
         elif err.check(ecred.UnauthorizedLogin):
-            self.notice(DISCORD, nickname,
-                "Login failed.  Goodbye.")
+            self.svc_message("Login failed.  Goodbye.")
         elif err.check(ecred.LoginDenied):
-            self.notice(DISCORD, nickname,
-                "Login denied. You've probably hit the rate limit.")
+            self.svc_message("Login denied. You've probably hit the rate limit.")
         elif err.check(chord.errors.LoginError):
-            self.notice(DISCORD, nickname,
-                "Unable to login, are you sure you used the correct email and password?")
+            self.svc_message("Unable to login, are you sure you used the correct email and password?")
         else:
             log.msg("Unhandled error during login:")
             log.err(err)
-            self.notice(DISCORD, nickname,
-                "Server error during login.  Sorry.")
+            self.svc_message("Server error during login.  Sorry.")
         self.transport.loseConnection()
+
+    def setAuthenticator(self, authenticator):
+        self._authenticator = authenticator
 
     def irc_unknown(self, prefix, command, params):
         self.sendCommand(irc.ERR_UNKNOWNCOMMAND, (command, ":Unknown command"), self.hostname)
 
 
-class IRCBridge(protocol.ServerFactory):
+class IRCGateway(protocol.ServerFactory):
     protocol = IRCProtocol
 
-    def __init__(self, realm, portal):
+    # def __init__(self, realm, portal):
+    #     self.realm = realm
+    #     self.portal = portal
+    #     self._serverInfo = {
+    #         "serviceName": 'drawbridge',
+    #         "serviceVersion": 'v 0.1',
+    #         "creationDate": ctime()
+    #         }
+    #
+    # def buildProtocol(self, addr):
+    #     p = self.protocol()
+    #     p.factory = self
+    #     return p
+    def __init__(self, realm):
         self.realm = realm
-        self.portal = portal
         self._serverInfo = {
             "serviceName": 'drawbridge',
             "serviceVersion": 'v 0.1',
@@ -201,6 +205,7 @@ class IRCBridge(protocol.ServerFactory):
     def buildProtocol(self, addr):
         p = self.protocol()
         p.factory = self
+        p.setAuthenticator(DiscordAuthenticator())
         return p
 
 
@@ -211,10 +216,12 @@ if __name__ == '__main__':
 
     # Initialize the Cred authentication system used by the IRC server.
     realm = DiscordWordsRealm('discord.gg')
-    portal = DiscordPortal(realm)
-
+    # portal = DiscordPortal(realm)
+    #
+    # # IRC server factory.
+    # ircfactory = IRCGateway(realm, portal)
     # IRC server factory.
-    ircfactory = IRCBridge(realm, portal)
+    ircfactory = IRCGateway(realm)
 
     # Connect a server to the TCP port 6667 endpoint and start listening.
     endpoint = TCP4ServerEndpoint(reactor, 6667)

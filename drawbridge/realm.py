@@ -16,6 +16,8 @@ class DiscordWordsRealm(service.WordsRealm):
     _encoding = 'utf-8'
 
     def __init__(self, *a, **kw):
+        if 'name' not in kw and len(a) < 1:
+            kw['name'] = 'discord.gg'
         super(DiscordWordsRealm, self).__init__(*a, **kw)
         self.users = {}
         self.guilds = {}
@@ -36,7 +38,7 @@ class DiscordWordsRealm(service.WordsRealm):
             avatar.realm = avatar.mind = None
         return logout
 
-    def requestAvatar(self, avatarId, credentials, mind, *interfaces):
+    def requestAvatar(self, avatarId, mind, *interfaces):
         if isinstance(avatarId, str):
             avatarId = avatarId.decode(self._encoding)
 
