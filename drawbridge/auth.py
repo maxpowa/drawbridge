@@ -49,6 +49,7 @@ class DiscordAuthenticator(object):
         self.username = username
         self.password = password
         self.token = None
+        self.default_server_id = None
         self.meta = {}
 
     def set_token(self, token):
@@ -57,6 +58,7 @@ class DiscordAuthenticator(object):
 
     def set_meta(self, meta):
         self.meta = meta
+        self.meta['default_server_id'] = self.default_server_id
         return defer.succeed(meta)
 
     def logout(self):
@@ -72,8 +74,8 @@ class DiscordAuthenticator(object):
 
     def checkPassword(self, password):
         key = [password]
-        if '/' in password:
-            key = password.split('/', 1)
+        if ':' in password:
+            key = password.split(':', 1)
         d = self.test_creds(*key)
         d.addCallback(self.set_token)
         d.addCallback(chord.get_user_for_token)
@@ -84,8 +86,11 @@ class DiscordAuthenticator(object):
         if len(args) not in [1,2]:
             return failure.Failure(error.UnauthorizedLogin('Unknown login format'))
 
-        print(repr(args))
-        if len(args)==1:
+        # User has specified a default server to connect to on login.
+        if '/' in args[0]:
+            args[0], self.default_server_id = args[0].split('/', 1)
+
+        if len(args)==1 or args[0] == 'token':
             (token,) = args
             return chord.check_token(token)
         if len(args)==2:

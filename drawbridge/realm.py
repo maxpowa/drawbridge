@@ -7,6 +7,12 @@ from twisted.words import service, iwords
 
 import json
 import chord
+from unidecode import unidecode
+
+from discord import Message, Server, Channel, PrivateChannel
+from discord import User as DiscordUser
+
+from random import randint as random_integer
 
 from zope.interface import implements
 from Queue import Queue
@@ -125,7 +131,7 @@ class DiscordWordsRealm(service.WordsRealm):
 
 
     def createGroup(self, server, channel):
-        name = server.name.replace(' ', '_') + "|" + channel.name.replace(' ', '_')
+        name = channel.name.replace(' ', '_')
         assert isinstance(name, unicode)
         def cbLookup(group):
             return failure.Failure(ewords.DuplicateGroup(name))
@@ -249,9 +255,10 @@ class User(DiscordClient):
     meta = None
     realm = None
 
+    server_id = None
     gateway = ''
     realName = ''
-    lazy_guilds = 0
+    _lazy_guilds = 0
 
     def __init__(self, name, credentials=None, reactor=None):
         if reactor is None:
@@ -300,6 +307,7 @@ class User(DiscordClient):
 
     def set_meta(self, meta):
         self.meta = meta
+        self.server_id = meta.get('default_server_id', self.server_id)
         self.realName = '{username}#{discriminator}'.format(**meta)
         self.name = meta['username']
         self.id = meta['id']
@@ -317,10 +325,36 @@ class User(DiscordClient):
             unavailable = guild.get('unavailable', None)
 
             if unavailable is None or unavailable is False: # it's available!
-                #self.mind.join()
+                server = Server(**guild)
+                server.me = property(lambda s: s.get_member(self.user.id))
+
+                self.mind.add_guild(server)
+
+                if self.server_id is None:
+                    self.server_id = server.id
+
+                if self.server_id == server.id:
+                    def join_fail(err):
+                        print(err)
+
+                    def join_success(_, channel):
+                        self.mind.names(self.mind.nickname, '#' + channel.name.replace(' ', '_'), [user.name for user in server.members if channel.permissions_for(user).read_messages])
+
+                    for chan in server.channels:
+                        if str(chan.type) != 'text':
+                            continue
+                        if not chan.permissions_for(chan.server.get_member(self.id)).read_messages:
+                            continue
+                        d = self.realm.createGroup(chan.server, chan)
+                        d.addCallback(self.mind.userJoined, self.mind)
+                        d.addCallback(join_success, chan)
+                        d.addErrback(join_fail)
                 pass
             else:
-                self.lazy_guilds = self.lazy_guilds + 1
+                self._lazy_guilds = self._lazy_guilds + 1
+
+        for pm in data.get('private_channels', []):
+            self.mind.add_private_channel(PrivateChannel(id=pm['id'], user=DiscordUser(**pm['recipient'])))
 
         # def join_fail(err):
         #     print(err)
@@ -346,6 +380,15 @@ class User(DiscordClient):
         d.addCallback(handle_success)
         return d
 
+    def send_message(self, channel_id, content):
+        url = 'https://discordapp.com/api/channels/{0}/messages'.format(channel_id)
+        payload = {
+            'content': unicode(content),
+            'nonce': random_integer(-2**63, 2**63 - 1)
+        }
+
+        return chord.http_post(url, self.credentials.token, payload)
+
     def update_user(self, presence):
         pass
 
@@ -360,3 +403,10 @@ class User(DiscordClient):
 
     def on_user_update(self, data):
         self.mind.svc_message(repr(data))
+
+    def on_message_create(self, data):
+        channel = self.mind.get_channel(data.get('channel_id'))
+        if (channel.server.id == self.server_id):
+            message = Message(channel=channel, **data)
+            sender = '{}!{}@discord.gg'.format(unidecode(message.author.name).replace(' ', '_'), message.author.discriminator)
+            self.mind.privmsg(sender, '#' + channel.name.replace(' ', '_'), message.clean_content)

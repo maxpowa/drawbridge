@@ -37,19 +37,73 @@ class IRCProtocol(service.IRCUser):
 
     def connectionMade(self):
         # Nooope, we'll just stop this right here.
-        self.irc_PRIVMSG = self.irc_DISCORD_PRIVMSG
+        self.irc_PRIVMSG = self.irc_REJECT_PRIVMSG
         self.realm = self.factory.realm
         self.hostname = self.realm.name
+        self._guilds = {}
+        self._private_channels = {}
+        self._private_channels_by_user = {}
 
     def connectionLost(self, reason):
+        self._guilds = {}
+        self._private_channels = {}
+        self._private_channels_by_user = {}
+
         if self.logout is not None:
             self.avatar.disconnect(reason)
             defer.maybeDeferred(self.logout)
 
+    @property
+    def guilds(self):
+        return self._guilds.values()
+
+    def add_guild(self, guild):
+        self._guilds[guild.id] = guild
+
+    def get_guild(self, guild_id):
+        return self._guilds.get(guild_id)
+
+    def remove_guild(self, guild):
+        self._guilds.pop(guild.id, None)
+
+    def get_channel(self, id):
+        if id is None:
+            return None
+
+        for guild in self.guilds:
+            channel = guild.get_channel(id)
+            if channel is not None:
+                return channel
+
+        pm = self.get_private_channel(id)
+        if pm is not None:
+            return pm
+
+    def get_channel_by_name(self, name):
+        raise ValueError('NYI')
+
+    @property
+    def private_channels(self):
+        return self._private_channels.values()
+
+    def get_private_channel(self, channel_id):
+        return self._private_channels.get(channel_id)
+
+    def get_private_channel_by_user(self, user_id):
+        return self._private_channels_by_user.get(user_id)
+
+    def add_private_channel(self, channel):
+        self._private_channels[channel.id] = channel
+        self._private_channels_by_user[channel.user.id] = channel
+
+    def remove_private_channel(self, channel):
+        self._private_channels.pop(channel.id, None)
+        self._private_channels_by_user.pop(channel.user.id, None)
+
     def svc_message(self, message):
         self.notice(DISCORD, self.nickname, message)
 
-    def irc_DISCORD_PRIVMSG(self, prefix, params):
+    def irc_REJECT_PRIVMSG(self, prefix, params):
         """Send a (private) message.
         Parameters: <msgtarget> <text to be sent>
         """
@@ -60,6 +114,32 @@ class IRCProtocol(service.IRCUser):
             self.transport.loseConnection()
         else:
             self.svc_message("Please wait until authentication has completed to send messages.")
+
+
+    def irc_DISCORD_PRIVMSG(self, prefix, params):
+        """
+        Called when we get a message.
+        """
+        user = prefix
+        channel = params[0]
+        message = params[-1]
+
+        if not message:
+            # Don't raise an exception if we get blank message.
+            return
+
+        if message[0] == X_DELIM:
+            m = ctcpExtract(message)
+            if m['extended']:
+                self.ctcpQuery(user, channel, m['extended'])
+
+            if not m['normal']:
+                return
+
+            message = ' '.join(m['normal'])
+
+        raise ValueError('NYI')
+        self.avatar.send_message(channel, message)
 
 
     def irc_WHOIS(self, prefix, params):
@@ -108,8 +188,8 @@ class IRCProtocol(service.IRCUser):
 
         if self.password is None and not self.avatar:
             self.svc_message('You must enter your Discord email and password in the Server '
-                'Password box of your client. Ensure they are slash separated,'
-                ' like the following: "user@email.com/securePassword".')
+                'Password box of your client. Ensure they are colon separated '
+                'as follows: "user@email.com:securePassword".')
             self.transport.loseConnection()
             return
 
@@ -147,7 +227,7 @@ class IRCProtocol(service.IRCUser):
 
     def _cbLogin(self, meta):
         # Let them send messages to the world
-        del self.irc_PRIVMSG
+        self.irc_PRIVMSG = self.irc_DISCORD_PRIVMSG
 
         self.avatar = User(self.nickname, self._authenticator)
         self.avatar.loggedIn(self.realm, self)
@@ -158,9 +238,9 @@ class IRCProtocol(service.IRCUser):
 
     def _ebLogin(self, err, nickname):
         if err.check(ewords.AlreadyLoggedIn):
-            self.svc_message("Already logged in.  No pod people allowed!")
+            self.svc_message("Already logged in. No pod people allowed!")
         elif err.check(ecred.UnauthorizedLogin):
-            self.svc_message("Login failed.  Goodbye.")
+            self.svc_message("Login failed. Goodbye.")
         elif err.check(ecred.LoginDenied):
             self.svc_message("Login denied. You've probably hit the rate limit.")
         elif err.check(chord.errors.LoginError):
