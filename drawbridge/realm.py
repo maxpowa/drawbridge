@@ -260,6 +260,8 @@ class User(DiscordClient):
     realName = ''
     _lazy_guilds = 0
 
+    _sent_nonces = []
+
     def __init__(self, name, credentials=None, reactor=None):
         if reactor is None:
             from twisted.internet import reactor
@@ -337,8 +339,14 @@ class User(DiscordClient):
                     def join_fail(err):
                         print(err)
 
-                    def join_success(_, channel):
-                        self.mind.names(self.mind.nickname, '#' + channel.name.replace(' ', '_'), [user.name for user in server.members if channel.permissions_for(user).read_messages])
+                    def names_generator(channel, members):
+                        for member in members:
+                            if channel.permissions_for(member).read_messages:
+                                yield member.name.replace(' ', '_')
+
+                    def join_success(_, s, channel):
+                        self.mind.names(self.mind.nickname, '#' + channel.name.replace(' ', '_'), names_generator(channel, s.members))
+                        self.mind.topic(self.mind.nickname, '#' + channel.name.replace(' ', '_'), channel.topic)
 
                     for chan in server.channels:
                         if str(chan.type) != 'text':
@@ -347,7 +355,7 @@ class User(DiscordClient):
                             continue
                         d = self.realm.createGroup(chan.server, chan)
                         d.addCallback(self.mind.userJoined, self.mind)
-                        d.addCallback(join_success, chan)
+                        d.addCallback(join_success, server, chan)
                         d.addErrback(join_fail)
                 pass
             else:
@@ -382,10 +390,12 @@ class User(DiscordClient):
 
     def send_message(self, channel_id, content):
         url = 'https://discordapp.com/api/channels/{0}/messages'.format(channel_id)
+        nonce = random_integer(-2**63, 2**63 - 1)
         payload = {
             'content': unicode(content),
-            'nonce': random_integer(-2**63, 2**63 - 1)
+            'nonce': nonce
         }
+        self._sent_nonces.append(unicode(nonce))
 
         return chord.http_post(url, self.credentials.token, payload)
 
@@ -406,7 +416,12 @@ class User(DiscordClient):
 
     def on_message_create(self, data):
         channel = self.mind.get_channel(data.get('channel_id'))
+        nonce = data.get('nonce', None)
+        if nonce in self._sent_nonces:
+            self._sent_nonces.remove(nonce)
+            return # We've already got this message in our client
         if (channel.server.id == self.server_id):
             message = Message(channel=channel, **data)
             sender = '{}!{}@discord.gg'.format(unidecode(message.author.name).replace(' ', '_'), message.author.discriminator)
-            self.mind.privmsg(sender, '#' + channel.name.replace(' ', '_'), message.clean_content)
+            for line in message.clean_content.split('\n'):
+                self.mind.privmsg(sender, '#' + channel.name.replace(' ', '_'), line)

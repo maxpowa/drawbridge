@@ -87,15 +87,22 @@ class DiscordAuthenticator(object):
             return failure.Failure(error.UnauthorizedLogin('Unknown login format'))
 
         # User has specified a default server to connect to on login.
-        if '/' in args[0]:
-            args[0], self.default_server_id = args[0].split('/', 1)
+        email = args[0]
+        if '/' in email:
+            tmp = email.split('/', 1)
+            email = tmp[0]
+            self.default_server_id = tmp[1]
 
-        if len(args)==1 or args[0] == 'token':
+        if len(args)==1:
             (token,) = args
             return chord.check_token(token)
         if len(args)==2:
-            (email, password) = args
-            return chord.get_token(email, password)
+            if email == 'token':
+                (_,token) = args
+                return chord.check_token(token)
+            else:
+                (_, password) = args
+                return chord.get_token(email, password)
 
 
 # @implementer(checkers.ICredentialsChecker)

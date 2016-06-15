@@ -120,6 +120,8 @@ class IRCProtocol(service.IRCUser):
         """
         Called when we get a message.
         """
+        service.IRCUser.irc_PRIVMSG(self, prefix, params)
+
         user = prefix
         channel = params[0]
         message = params[-1]
@@ -128,18 +130,12 @@ class IRCProtocol(service.IRCUser):
             # Don't raise an exception if we get blank message.
             return
 
-        if message[0] == X_DELIM:
-            m = ctcpExtract(message)
-            if m['extended']:
-                self.ctcpQuery(user, channel, m['extended'])
-
-            if not m['normal']:
-                return
-
-            message = ' '.join(m['normal'])
-
-        raise ValueError('NYI')
-        self.avatar.send_message(channel, message)
+        if channel.startswith('#'):
+            server = self.get_guild(self.avatar.server_id)
+            for chan in server.channels:
+                irc_chan_name = '#' + chan.name.replace(' ', '_')
+                if irc_chan_name == channel:
+                    self.avatar.send_message(chan.id, message)
 
 
     def irc_WHOIS(self, prefix, params):
