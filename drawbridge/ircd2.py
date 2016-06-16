@@ -9,11 +9,13 @@ from twisted.python import log
 from twisted.python import logfile
 from twisted.words import service, iwords, ewords
 from twisted.words.protocols import irc
+from twisted.logger import LogLevel
 
 from realm import DiscordWordsRealm, User
 from auth import DiscordAuthenticator
 
 import chord
+from unidecode import unidecode
 
 DISCORD = "Discord!services@discord.gg"
 
@@ -38,7 +40,7 @@ class IRCProtocol(service.IRCUser):
     def connectionMade(self):
         # Nooope, we'll just stop this right here.
         self.irc_PRIVMSG = self.irc_REJECT_PRIVMSG
-        self.realm = self.factory.realm
+        self.realm = DiscordWordsRealm('discord.gg')
         self.hostname = self.realm.name
         self._guilds = {}
         self._private_channels = {}
@@ -51,6 +53,7 @@ class IRCProtocol(service.IRCUser):
 
         if self.logout is not None:
             self.avatar.disconnect(reason)
+            del self.avatar
             defer.maybeDeferred(self.logout)
 
     @property
@@ -114,28 +117,6 @@ class IRCProtocol(service.IRCUser):
             self.transport.loseConnection()
         else:
             self.svc_message("Please wait until authentication has completed to send messages.")
-
-
-    def irc_DISCORD_PRIVMSG(self, prefix, params):
-        """
-        Called when we get a message.
-        """
-        service.IRCUser.irc_PRIVMSG(self, prefix, params)
-
-        user = prefix
-        channel = params[0]
-        message = params[-1]
-
-        if not message:
-            # Don't raise an exception if we get blank message.
-            return
-
-        if channel.startswith('#'):
-            server = self.get_guild(self.avatar.server_id)
-            for chan in server.channels:
-                irc_chan_name = '#' + chan.name.replace(' ', '_')
-                if irc_chan_name == channel:
-                    self.avatar.send_message(chan.id, message)
 
 
     def irc_WHOIS(self, prefix, params):
@@ -223,9 +204,14 @@ class IRCProtocol(service.IRCUser):
 
     def _cbLogin(self, meta):
         # Let them send messages to the world
-        self.irc_PRIVMSG = self.irc_DISCORD_PRIVMSG
+        del self.irc_PRIVMSG
 
+        nick = unidecode(self._authenticator.meta.get('username')).replace(' ', '_')
+        sender = '{}!{}@discord.gg'.format(self.nickname, self._authenticator.meta.get('discriminator'))
+        self.sendLine(':{} NICK :{}'.format(sender, nick))
+        self.nickname = nick
         self.avatar = User(self.nickname, self._authenticator)
+        self.avatar.protocol = self
         self.avatar.loggedIn(self.realm, self)
 
         self.logout = self._authenticator.logout
@@ -255,23 +241,8 @@ class IRCProtocol(service.IRCUser):
 
 
 class IRCGateway(protocol.ServerFactory):
-    protocol = IRCProtocol
-
-    # def __init__(self, realm, portal):
-    #     self.realm = realm
-    #     self.portal = portal
-    #     self._serverInfo = {
-    #         "serviceName": 'drawbridge',
-    #         "serviceVersion": 'v 0.1',
-    #         "creationDate": ctime()
-    #         }
-    #
-    # def buildProtocol(self, addr):
-    #     p = self.protocol()
-    #     p.factory = self
-    #     return p
-    def __init__(self, realm):
-        self.realm = realm
+    def __init__(self):
+        self.realm = None
         self._serverInfo = {
             "serviceName": 'drawbridge',
             "serviceVersion": 'v 0.1',
@@ -279,25 +250,24 @@ class IRCGateway(protocol.ServerFactory):
             }
 
     def buildProtocol(self, addr):
-        p = self.protocol()
+        p = IRCProtocol()
         p.factory = self
         p.setAuthenticator(DiscordAuthenticator())
         return p
 
 
 if __name__ == '__main__':
-    chord.start_logging()
+    chord.start_logging(LogLevel.info)
     #log.startLogging(sys.stdout)
     #log.startLogging(logfile.LogFile('out.log', '.', rotateLength=None))
 
     # Initialize the Cred authentication system used by the IRC server.
-    realm = DiscordWordsRealm('discord.gg')
     # portal = DiscordPortal(realm)
     #
     # # IRC server factory.
     # ircfactory = IRCGateway(realm, portal)
     # IRC server factory.
-    ircfactory = IRCGateway(realm)
+    ircfactory = IRCGateway()
 
     # Connect a server to the TCP port 6667 endpoint and start listening.
     endpoint = TCP4ServerEndpoint(reactor, 6667)

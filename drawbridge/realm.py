@@ -254,6 +254,7 @@ class User(DiscordClient):
 
     meta = None
     realm = None
+    _protocol = None
 
     server_id = None
     gateway = ''
@@ -265,6 +266,7 @@ class User(DiscordClient):
     def __init__(self, name, credentials=None, reactor=None):
         if reactor is None:
             from twisted.internet import reactor
+
         self.reactor = reactor
         self.name = name
         self.id = name
@@ -294,8 +296,30 @@ class User(DiscordClient):
 
 
     def send(self, recipient, message):
-        # Translate to Discord
-        return recipient.receive(self.mind, recipient, message)
+        # Send to IRC first
+        recipient.receive(self.mind, recipient, message)
+
+        message = message.get('text', '')
+        if message.startswith('\x01ACTION '):
+            message = message.replace('ACTION ', '', 1).replace('\x01', '_')
+
+        channel_id = None
+        if isinstance(recipient, Group):
+            server = self.mind.get_guild(self.server_id)
+            for chan in server.channels:
+                irc_chan_name = chan.name.replace(' ', '_')
+                if irc_chan_name == recipient.name:
+                    channel_id = chan.id
+
+        url = 'https://discordapp.com/api/channels/{0}/messages'.format(channel_id)
+        nonce = random_integer(-2**63, 2**63 - 1)
+        payload = {
+            'content': unicode(message),
+            'nonce': nonce
+        }
+        self._sent_nonces.append(unicode(nonce))
+
+        return chord.http_post(url, self.credentials.token, payload)
 
 
     def itergroups(self):
@@ -304,6 +328,8 @@ class User(DiscordClient):
 
     def logout(self):
         self.disconnect(u'Leaving...')
+        if (self._protocol):
+            self._protocol.sendClose()
         for g in self.groups[:]:
             self.leave(g)
 
@@ -339,13 +365,8 @@ class User(DiscordClient):
                     def join_fail(err):
                         print(err)
 
-                    def names_generator(channel, members):
-                        for member in members:
-                            if channel.permissions_for(member).read_messages:
-                                yield member.name.replace(' ', '_')
-
                     def join_success(_, s, channel):
-                        self.mind.names(self.mind.nickname, '#' + channel.name.replace(' ', '_'), names_generator(channel, s.members))
+                        self.mind.names(self.mind.nickname, '#' + channel.name.replace(' ', '_'), [member.name.replace(' ', '_') for member in channel.members])
                         self.mind.topic(self.mind.nickname, '#' + channel.name.replace(' ', '_'), channel.topic)
 
                     for chan in server.channels:
@@ -388,17 +409,6 @@ class User(DiscordClient):
         d.addCallback(handle_success)
         return d
 
-    def send_message(self, channel_id, content):
-        url = 'https://discordapp.com/api/channels/{0}/messages'.format(channel_id)
-        nonce = random_integer(-2**63, 2**63 - 1)
-        payload = {
-            'content': unicode(content),
-            'nonce': nonce
-        }
-        self._sent_nonces.append(unicode(nonce))
-
-        return chord.http_post(url, self.credentials.token, payload)
-
     def update_user(self, presence):
         pass
 
@@ -407,9 +417,8 @@ class User(DiscordClient):
         pass
 
     def on_presence_update(self, data):
-        id = data['user']['id']
-        #self.realm.update_user()
-        #self.mind.svc_message(repr(data))
+        # Unused atm
+        pass
 
     def on_user_update(self, data):
         self.mind.svc_message(repr(data))
@@ -420,7 +429,7 @@ class User(DiscordClient):
         if nonce in self._sent_nonces:
             self._sent_nonces.remove(nonce)
             return # We've already got this message in our client
-        if (channel.server.id == self.server_id):
+        if (channel and channel.server.id == self.server_id):
             message = Message(channel=channel, **data)
             sender = '{}!{}@discord.gg'.format(unidecode(message.author.name).replace(' ', '_'), message.author.discriminator)
             for line in message.clean_content.split('\n'):

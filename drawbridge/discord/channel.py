@@ -147,6 +147,15 @@ class Channel(Hashable):
         return ret
 
     @property
+    def members(self):
+        """Returns a generator of members with access to this channel"""
+        def filter_members(channel, members):
+            for member in members:
+                if channel.permissions_for(member).read_messages:
+                    yield member
+        return filter_members(self, self.server.members)
+
+    @property
     def is_default(self):
         """bool : Indicates if this is the default channel for the :class:`Server` it belongs to."""
         return self.server.id == self.id
